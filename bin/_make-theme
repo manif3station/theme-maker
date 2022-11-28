@@ -1,0 +1,168 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+
+use HTML::TreeBuilder;
+use File::Path qw(mkpath);
+use File::Copy qw(move copy);
+
+sub parse_html {
+    my ($file) = @_;
+    my $builder = HTML::TreeBuilder->new;
+    my $root = $builder->parse_file($file);
+    $root->elementify;
+}
+
+sub to_keep_tag {
+    my ($tag) = @_;
+
+    if (my $content = $tag->attr('content')) {
+        return if $content =~ m/Redux/;
+        return if $content =~ m/WooCommerce/;
+        return if $content =~ m/WordPress/;
+        return if $content =~ m/favicon.ico/;
+    }
+    elsif (my $name = $tag->attr('name')) {
+        return if $name =~ m/darkreader/;
+    }
+    elsif (my $class = $tag->attr('class')) {
+        return if $class =~ m/darkreader/;
+    }
+    elsif (my $rel = $tag->attr('rel')) {
+        return if $rel =~ m/dns-prefetch/;
+        return if $rel =~ m/canonical/;
+        return if $rel =~ m/shortlink/;
+    }
+    elsif ($tag->tag eq 'title') {
+        return;
+    }
+
+    return 1;
+}
+
+sub update_url {
+    my ($tag, %opts) = @_;
+
+    my $from_prefix = $opts{'--from-prefix'};
+    my $to_prefix   = $opts{'--to-prefix'} // '';
+
+    $to_prefix = "/$to_prefix" if $to_prefix;
+
+    my ($url, $attr);
+
+    $url = $tag->attr('href');
+    $attr = 'href' if $url;
+
+    if (!$url) {
+        $url = $tag->attr('src');
+        $attr = 'src' if $url;
+    }
+
+    if ( $url && $from_prefix && $to_prefix ) {
+        my ($ext) = ( $url =~ m/\.(css)/i );
+        my $folder = '/css' if $ext;
+
+        if (!$ext) {
+            ($ext) = ( $url =~ m/\.(js)/i );
+            $folder = '/js' if $ext;
+        }
+
+        if (!$ext) {
+            ($ext) = ( $url =~ m/\.(jpg|jpeg|png|gif|ico|svg)/i );
+            $folder = '/images' if $ext;
+        }
+
+        if ($folder) {
+            my $old_path = $url;
+            $url =~ s/\Q$from_prefix\E/$folder$to_prefix/;
+            my $new_path = $url;
+            $tag->attr( $attr => $url );
+            my ($dir, $file) = ($new_path =~ m{(.*)/(.*)});
+            mkpath $dir = "public/$dir";
+            copy $old_path, "$dir/$file";
+        }
+    }
+}
+
+sub grep_tag {
+    my ( $tags, \@types, %opts ) = @_;
+
+    my ( %got, @others );
+
+    my %types = map { $_ => 1 } @types;
+
+    foreach my $tag (@$tags) {
+        next if !to_keep_tag $tag;
+
+        my $type = $tag->tag;
+
+        if ( !$types{$type} ) {
+            push @others, $tag;
+            next;
+        }
+
+        update_url $tag, %opts;
+
+        push @{ $got{$type} }, $tag->as_HTML;
+    }
+
+    my %seen = ();
+
+    my $got .= join "\n", 
+      grep { !$seen{$_}++ } map { sort @{ $got{$_} //= [] } } @types;
+
+    return ($got, @others);
+}
+
+my %wrote = ();
+
+sub save {
+    my ($html, $dir, $file) = @_;
+
+    $dir = 'src/views' . $dir;
+
+    mkpath $dir;
+
+    my $mode = $wrote{$file}++ ? '>>' : '>';
+
+    open my $fh, $mode, "$dir/$file.tt";
+
+    print $fh $html;
+}
+
+sub main {
+    my ( $file, %opts ) = @_;
+
+    my $html = parse_html $file;
+
+    my @tops = $html->content->@*;
+
+    my $head = shift(@tops)->content;
+
+    my $body = shift(@tops)->content;
+
+    my ($tags, @other_tags) = grep_tag $head, [qw(meta link style)], %opts;
+
+    save $tags, '/layouts', 'head';
+
+    ($tags, @other_tags) = grep_tag \@other_tags, [qw(script)], %opts;
+
+    save $tags, '/layouts', 'end';
+
+    ($tags) = grep_tag $body, [qw(style)], %opts;
+
+    save $tags, '/layouts', 'head', '>>';
+
+    ($tags) = grep_tag $body, [qw(script)], %opts;
+
+    save $tags, '/layouts', 'end', '>>';
+
+    ($tags) = grep_tag \@tops, [qw(script)], %opts;
+
+    save $tags, '/layouts', 'end', '>';
+
+    exit;
+}
+
+main @ARGV

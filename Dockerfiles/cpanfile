@@ -1,0 +1,3 @@
+requires 'File::Copy';
+requires 'File::Path';
+requires 'HTML::TreeBuilder';
