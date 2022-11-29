@@ -2,6 +2,7 @@
 
 use strict;
 use warnings;
+use experimental qw(declared_refs);
 
 use HTML::TreeBuilder;
 use File::Path qw(mkpath);
@@ -42,47 +43,50 @@ sub to_keep_tag {
 }
 
 sub update_url {
-    my ($tag, %opts) = @_;
+    my ($url, %opts) = @_;
+
+    return '' if !$url;
 
     my $from_prefix = $opts{'--from-prefix'};
     my $to_prefix   = $opts{'--to-prefix'} // '';
 
     $to_prefix = "/$to_prefix" if $to_prefix;
 
-    my ($url, $attr);
+    return '' if $url =~ m{^http};
 
-    $url = $tag->attr('href');
-    $attr = 'href' if $url;
+    my ($ext) = ( $url =~ m/\.(css)/i );
+    my $folder = '/css' if $ext;
 
-    if (!$url) {
-        $url = $tag->attr('src');
-        $attr = 'src' if $url;
+    if (!$ext) {
+        ($ext) = ( $url =~ m/\.(js)/i );
+        $folder = '/js' if $ext;
     }
 
-    if ( $url && $from_prefix && $to_prefix ) {
-        my ($ext) = ( $url =~ m/\.(css)/i );
-        my $folder = '/css' if $ext;
-
-        if (!$ext) {
-            ($ext) = ( $url =~ m/\.(js)/i );
-            $folder = '/js' if $ext;
-        }
-
-        if (!$ext) {
-            ($ext) = ( $url =~ m/\.(jpg|jpeg|png|gif|ico|svg)/i );
-            $folder = '/images' if $ext;
-        }
-
-        if ($folder) {
-            my $old_path = $url;
-            $url =~ s/\Q$from_prefix\E/$folder$to_prefix/;
-            my $new_path = $url;
-            $tag->attr( $attr => $url );
-            my ($dir, $file) = ($new_path =~ m{(.*)/(.*)});
-            mkpath $dir = "public/$dir";
-            copy $old_path, "$dir/$file";
-        }
+    if (!$ext) {
+        ($ext) = ( $url =~ m/\.(ico|jpg|jpeg|png|gif|ico|svg)/i );
+        $folder = '/images' if $ext;
     }
+
+    if ($folder) {
+        my $old_path = $url;
+        $url =~ s/\Q$from_prefix\E/$folder$to_prefix/;
+        my $new_path = $url;
+        my ($dir, $file) = ($new_path =~ m{(.*)/(.*)});
+        mkpath $dir = "$opts{plugin_dir}/src/public$folder";
+        copy "$opts{plugin_dir}/$old_path", "$dir/$file";
+    }
+
+    return $url;
+}
+
+sub tag2html {
+    join "\n", map { $_->as_HTML } @_;
+}
+
+sub attr2str {
+    my ($tag) = @_;
+    my $html = join ' ', map { sprintf '%s="%s"', $_ // '', $tag->attr($_) // '' } grep { $_ !~ m/^_/ } sort $tag->all_attr_names;
+    $html . join ' ', map { sprintf '%s="%s"', $_ // '', $tag->attr($_) // '' } grep { $_ !~ m/^_/ } sort $tag->all_external_attr_names;
 }
 
 sub grep_tag {
@@ -97,12 +101,22 @@ sub grep_tag {
 
         my $type = $tag->tag;
 
+        my $url = $tag->attr('href');
+        my $attr = 'href' if $url;
+
+        if (!$url) {
+            $url = $tag->attr('src');
+            $attr = 'src' if $url;
+        }
+
+        if (my $new_url = update_url $url, %opts) {
+            $tag->attr($attr => $new_url);
+        }
+
         if ( !$types{$type} ) {
             push @others, $tag;
             next;
         }
-
-        update_url $tag, %opts;
 
         push @{ $got{$type} }, $tag->as_HTML;
     }
@@ -118,9 +132,11 @@ sub grep_tag {
 my %wrote = ();
 
 sub save {
-    my ($html, $dir, $file) = @_;
+    my ($html, $dir, $file, %opts) = @_;
 
-    $dir = 'src/views' . $dir;
+    return if !$html;
+
+    $dir = "$opts{plugin_dir}/src/views/$dir";
 
     mkpath $dir;
 
@@ -132,35 +148,68 @@ sub save {
 }
 
 sub main {
-    my ( $file, %opts ) = @_;
+    my ( $plugin, $file, %opts ) = @_;
+
+    my $plugin_dir = "src/plugins/$plugin";
+
+    die "plugin dir '$plugin_dir' is not found" if !-d $plugin_dir;
+
+    $opts{plugin_dir} = $plugin_dir;
+
+    $file = "$plugin_dir/$file";
+
+    die "template file '$file' is not found" if !-f $file;
+
+    ($opts{'--from-prefix'}) = map { "./$_\_files" } ($file =~ m/([^\/]+)\.html$/);
+
+    $opts{'--to-prefix'} = $plugin;
 
     my $html = parse_html $file;
 
+    save attr2str($html), 'layouts/attr', 'html', %opts;
+
     my @tops = $html->content->@*;
 
-    my $head = shift(@tops)->content;
+    my $head_tag = shift @tops;
 
-    my $body = shift(@tops)->content;
+    save attr2str($head_tag), 'layouts/attr', 'head', %opts;
+
+    my $head = $head_tag->content;
+
+    my $body_tag = shift @tops;
+
+    save attr2str($body_tag), 'layouts/attr', 'body', %opts;
+
+    my $body = $body_tag->content;
 
     my ($tags, @other_tags) = grep_tag $head, [qw(meta link style)], %opts;
 
-    save $tags, '/layouts', 'head';
+    save $tags, layouts => 'head', %opts;
 
     ($tags, @other_tags) = grep_tag \@other_tags, [qw(script)], %opts;
 
-    save $tags, '/layouts', 'end';
+    save tag2html(@other_tags), layouts => 'head', %opts;
+
+    save $tags, layouts => 'end', %opts;
 
     ($tags) = grep_tag $body, [qw(style)], %opts;
 
-    save $tags, '/layouts', 'head', '>>';
+    save $tags, layouts => 'head', %opts;
 
     ($tags) = grep_tag $body, [qw(script)], %opts;
 
-    save $tags, '/layouts', 'end', '>>';
+    save $tags, layouts => 'end', %opts;
 
     ($tags) = grep_tag \@tops, [qw(script)], %opts;
 
-    save $tags, '/layouts', 'end', '>';
+    save $tags, layouts => 'end', %opts;
+
+    my $body_html = $body_tag->as_HTML;
+
+    $body_html =~ s{(\Q$opts{'--from-prefix'}\E[^"]+)}
+                  {update_url $1, %opts}ge;
+
+    save $body_html, './' => 'index', %opts;
 
     exit;
 }
